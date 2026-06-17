@@ -1,0 +1,40 @@
+[project]
+name = "telecom-rag-chatbot"
+version = "1.0.0"
+description = "RAG Telecom Customer Care Chatbot — grounded answers over FAQ, tickets, and guide PDF."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "langchain>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langchain-community>=0.3.0",
+    "langchain-groq>=0.2.0",
+    "langchain-huggingface>=0.1.0",
+    "langchain-chroma>=0.1.4",
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+    "pypdf>=4.0.0",
+    "python-dotenv>=1.0.0",
+    "streamlit>=1.36.0",
+]
+
+[project.scripts]
+telecom-cli = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "config.py",
+    "embeddings.py",
+    "retriever.py",
+    "chain.py",
+    "main.py",
+    "app.py",
+    "ingest_faq.py",
+    "ingest_tickets.py",
+    "ingest_guides.py",
+    "ingest_all.py",
+]
