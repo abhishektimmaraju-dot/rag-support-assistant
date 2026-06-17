@@ -55,21 +55,31 @@ class MergedRetriever:
             doc.metadata.setdefault("source", label)
         return docs
 
-    def retrieve(self, query: str) -> list[Document]:
-        """Return the merged, source-labelled documents for the query."""
-        with ThreadPoolExecutor(max_workers=len(COLLECTIONS)) as pool:
+    def retrieve(self, query: str, labels: list[str] | None = None) -> list[Document]:
+        """Return the merged, source-labelled documents for the query.
+
+        If `labels` is given, only those collections are searched (e.g.
+        ["PLANS"] for the pricing route, ["FAQ", "TICKETS", "GUIDES"] for the
+        document route). This lets the router keep each path's context focused.
+        """
+        cols = [
+            (label, collection, k)
+            for label, collection, k in COLLECTIONS
+            if labels is None or label in labels
+        ]
+        with ThreadPoolExecutor(max_workers=max(1, len(cols))) as pool:
             futures = [
                 pool.submit(self._search, label, collection, k, query)
-                for label, collection, k in COLLECTIONS
+                for label, collection, k in cols
             ]
             results: list[Document] = []
             for future in futures:
                 results.extend(future.result())
         return results
 
-    def format_context(self, query: str) -> str:
+    def format_context(self, query: str, labels: list[str] | None = None) -> str:
         """Retrieve documents and render them as a source-labelled context block."""
-        docs = self.retrieve(query)
+        docs = self.retrieve(query, labels)
         if not docs:
             return ""
         blocks = []
