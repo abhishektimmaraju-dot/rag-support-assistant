@@ -19,8 +19,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 
 from config import LLM_MODEL, LLM_TEMPERATURE, require_groq_key
+from hybrid import retrieve_telecom
 from plan_facts import build_pricing_reference
-from retriever import get_retriever
+from retriever import format_docs, get_retriever
 from router import classify
 
 SYSTEM_PROMPT = """You are NovaCell's customer-care assistant. You help \
@@ -69,8 +70,7 @@ OUT_OF_SCOPE_MESSAGE = (
     "have a telecom question, I'm happy to help."
 )
 
-# Collections used per route (keeps each path's context focused).
-TELECOM_LABELS = ["FAQ", "TICKETS", "GUIDES"]
+# Collections used by the pricing route (telecom route uses hybrid.py).
 PLANS_LABELS = ["PLANS"]
 
 
@@ -96,13 +96,12 @@ def _get_llm_chain():
 
 def _build_context(question: str, route: str) -> str:
     """Assemble route-specific context — focused, not everything-at-once."""
-    retriever = get_retriever()
     if route == "pricing":
         # Deterministic ranking first, then plans-only docs (no FAQ/guide noise).
-        plans_ctx = retriever.format_context(question, labels=PLANS_LABELS)
+        plans_ctx = get_retriever().format_context(question, labels=PLANS_LABELS)
         return f"[PLANS]\n{build_pricing_reference()}\n\n---\n\n{plans_ctx}"
-    # telecom: documents only
-    return retriever.format_context(question, labels=TELECOM_LABELS)
+    # telecom: hybrid (dense + BM25) retrieval over the document collections
+    return format_docs(retrieve_telecom(question))
 
 
 def answer(question: str) -> str:

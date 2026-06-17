@@ -79,14 +79,18 @@ class MergedRetriever:
 
     def format_context(self, query: str, labels: list[str] | None = None) -> str:
         """Retrieve documents and render them as a source-labelled context block."""
-        docs = self.retrieve(query, labels)
-        if not docs:
-            return ""
-        blocks = []
-        for doc in docs:
-            source = doc.metadata.get("source", "UNKNOWN")
-            blocks.append(f"[{source}]\n{doc.page_content}")
-        return "\n\n---\n\n".join(blocks)
+        return format_docs(self.retrieve(query, labels))
+
+
+def format_docs(docs: list[Document]) -> str:
+    """Render a list of documents as a single source-labelled context block."""
+    if not docs:
+        return ""
+    blocks = []
+    for doc in docs:
+        source = doc.metadata.get("source", "UNKNOWN")
+        blocks.append(f"[{source}]\n{doc.page_content}")
+    return "\n\n---\n\n".join(blocks)
 
 
 # Process-wide singleton so the Streamlit app and CLI reuse loaded stores.
