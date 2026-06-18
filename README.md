@@ -110,6 +110,8 @@ re-running never creates duplicates.
 | `app.py` | Streamlit chat UI |
 | `main.py` | CLI REPL |
 | `eval.py` | Golden-question regression tests (`uv run eval.py`) |
+| `compare_retrieval.py` | Dense vs hybrid vs rerank — quality + latency (local) |
+| `prototype_plan_query.py` | Prototype: text-to-SQL pricing path that scales to 1000s of plans |
 
 ## Troubleshooting
 

@@ -140,3 +140,63 @@ off-topic questions by skipping the answer call entirely.
 uv run compare_retrieval.py   # retrieval quality + latency (local, no API)
 uv run eval.py                # end-to-end answer correctness (uses Groq)
 ```
+
+---
+
+## 7. Scaling finding — the pricing path does NOT scale (and the fix)
+
+### The limitation
+The shipped pricing route (`chain.py` → `plan_facts.build_pricing_reference()`)
+puts the **entire plan catalog** into the prompt. That is a deliberate shortcut
+that works *only because there are 14 plans*. It fails at scale because:
+
+- **Context window** — thousands of plans don't fit.
+- **Cost & latency** — every pricing question pays for the whole catalog.
+- **"Lost in the middle"** — LLMs reason worse as context grows; the right plan
+  gets buried.
+
+This is a retrieval-vs-computation mismatch: ranking, filtering and counting are
+*data operations*, and we were asking the LLM to do them by reading raw text.
+
+### The insight — pricing questions are two different kinds
+- **Aggregate / filter** ("cheapest unlimited", "postpaid under $50", "how many
+  plans have >20 GB hotspot") → need **computation over the whole catalog**.
+- **Specific lookup** ("tell me about the Unlimited Plus plan") → need
+  **retrieval of a few relevant rows** (the hybrid + rerank pipeline).
+
+### The fix — structured query path (text-to-SQL)
+Keep plans in a **structured store** and *query* it instead of *dumping* it. The
+LLM translates the question into a read-only SQL `SELECT`; code validates and
+executes it; only the matching rows come back. The context the LLM sees is the
+**schema (fixed, ~120 tokens)** — independent of catalog size.
+
+Prototype: [prototype_plan_query.py](prototype_plan_query.py) — builds a SQLite
+table of **14 real + 5,000 synthetic plans** and answers questions over all
+5,014:
+
+| Question | Generated SQL (abridged) | Returned |
+|---|---|---|
+| Cheapest unlimited, no eligibility | `WHERE data_unlimited=1 AND eligibility IS NULL ORDER BY monthly_price LIMIT 1` | 1 row |
+| Postpaid < $50, unlimited, cheapest first | `WHERE type='postpaid' AND monthly_price<50 AND data_unlimited=1 ORDER BY monthly_price` | 10 rows |
+| Plans with > 20 GB hotspot | `SELECT COUNT(*) … WHERE hotspot_gb>20` | **2,011** |
+
+**Context sent to the LLM: the schema only — same whether the catalog has 14
+plans or 50,000.** The count query is the clincher: an aggregate over 5,000 rows
+returned as one number, which "dump everything" fundamentally cannot do.
+
+### Safety
+Generated SQL is validated before running: single statement, must start with
+`SELECT`/`WITH`, and `insert/update/delete/drop/alter/create/replace/attach/
+pragma` are rejected. (During the demo the validator correctly rejected a
+malformed `SQL: SELECT …` line — guard working as intended.)
+
+### Recommendation at scale
+Split the pricing route by sub-intent: **aggregate/filter → structured query**
+(the prototype), **specific lookup → hybrid retrieval + rerank** (already built).
+Either way the LLM sees a small, relevant slice — never the catalog. Same
+throughline as everywhere else in this project: **let code do the computation,
+reserve the LLM for understanding the question and phrasing the answer.**
+
+> Status: `prototype_plan_query.py` is a standalone demo, not wired into the app.
+> The shipped pricing path remains the dump-all approach, which is correct for
+> the current 14-plan catalog.
