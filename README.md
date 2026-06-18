@@ -13,11 +13,12 @@ Built per [PRD.md](PRD.md).
 User question
      │
      ▼
-Merged Retriever (parallel, top-3 each)
-  ├── ChromaDB · faq       FAQ entries
-  ├── ChromaDB · tickets   resolved ticket resolutions
-  └── ChromaDB · guides    PDF guide chunks
-     │  (9 source-labelled context docs)
+Router (router.py) ── classify ──► pricing | telecom | other
+     │
+     ├─ other   → deterministic refusal (no LLM call)
+     ├─ pricing → plan_facts pricing reference + plans-only context
+     └─ telecom → hybrid retrieval (dense + BM25) → cross-encoder re-rank
+     │
      ▼
 ChatPromptTemplate (context-only persona)
      ▼
@@ -27,9 +28,12 @@ Streamed answer → Streamlit / CLI
 ```
 
 - **Embeddings:** `all-MiniLM-L6-v2`, run locally (no embedding API cost).
-- **Vector store:** ChromaDB, persisted to `chroma_store/`.
+- **Vector store:** ChromaDB, persisted to `chroma_store/`; BM25 keyword index in memory.
+- **Re-ranker:** `ms-marco-MiniLM-L-6-v2` cross-encoder (local).
 - **LLM:** `qwen/qwen3-32b` via Groq.
-- **Framework:** LangChain (LCEL). **UI:** Streamlit + CLI.
+- **Framework:** LangChain. **UI:** Streamlit + CLI.
+
+See [CODEBASE_EXPLANATION.md](CODEBASE_EXPLANATION.md) for the full architecture.
 
 ## Setup
 
@@ -86,7 +90,7 @@ re-running never creates duplicates.
 
 1. Write `ingest_<name>.py` that builds a new Chroma collection (copy an
    existing ingest script).
-2. Register `(LABEL, COLLECTION_NAME)` in `COLLECTIONS` in
+2. Register `(LABEL, COLLECTION_NAME, TOP_K)` in `COLLECTIONS` in
    [retriever.py](retriever.py).
 
 ## Project layout
@@ -97,11 +101,17 @@ re-running never creates duplicates.
 | `embeddings.py` | Local HuggingFace embedding singleton |
 | `ingest_faq.py` / `ingest_tickets.py` / `ingest_guides.py` / `ingest_plans.py` | Per-source ingestion |
 | `ingest_all.py` | Build all collections in one pass |
-| `retriever.py` | Merged per-collection retrieval + context formatting |
+| `router.py` | Classifies each question: pricing / telecom / out-of-scope |
+| `retriever.py` | Per-collection (or subset) retrieval + context formatting |
+| `hybrid.py` | Telecom path: dense + BM25 recall, then re-rank |
+| `rerank.py` | Cross-encoder re-ranking for precision |
 | `plan_facts.py` | Deterministic pricing reference computed from `plans.json` |
-| `chain.py` | Prompt + Groq LLM + LCEL chain (+ streaming) |
+| `chain.py` | Routes the query, builds context, prompts Groq, streams |
 | `app.py` | Streamlit chat UI |
 | `main.py` | CLI REPL |
+| `eval.py` | Golden-question regression tests (`uv run eval.py`) |
+| `compare_retrieval.py` | Dense vs hybrid vs rerank — quality + latency (local) |
+| `prototype_plan_query.py` | Prototype: text-to-SQL pricing path that scales to 1000s of plans |
 
 ## Troubleshooting
 

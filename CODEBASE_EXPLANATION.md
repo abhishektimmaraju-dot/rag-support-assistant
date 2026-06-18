@@ -12,58 +12,47 @@ back.
 ## 1. High-Level Architecture Diagram
 
 The system is a single Python application with two interchangeable front ends
-(a Streamlit web UI and a CLI), a shared retrieval-augmented generation (RAG)
-core, a local vector database, and one external service (Groq) for generation.
-The diagram below illustrates how the components interact:
+(a Streamlit web UI and a CLI). Each question is **routed** before retrieval:
+the router decides *how* to answer, then sends it down a focused path. The
+diagram below shows the flow:
 
 ```
-                          ┌─────────────────────────────────────┐
-                          │            FRONT ENDS                 │
-                          │  ┌──────────────┐   ┌──────────────┐  │
-                          │  │  app.py      │   │  main.py     │  │
-                          │  │ (Streamlit)  │   │  (CLI REPL)  │  │
-                          │  └──────┬───────┘   └──────┬───────┘  │
-                          └─────────┼──────────────────┼──────────┘
-                                    │                  │
-                                    └────────┬─────────┘
-                                             ▼
-                              ┌──────────────────────────┐
-                              │        chain.py          │   RAG core
-                              │  prompt + LLM + LCEL      │
-                              │  stream_answer()          │
-                              └───────┬───────────┬───────┘
-                                      │           │
-                  ┌───────────────────┘           └───────────────────┐
-                  ▼                                                    ▼
-      ┌────────────────────────┐                          ┌────────────────────────┐
-      │     retriever.py       │                          │   Groq LLM (external)  │
-      │  MergedRetriever        │                          │   qwen/qwen3-32b       │
-      │  per-collection top-k   │                          │   temperature = 0      │
-      └───────────┬────────────┘                          └────────────────────────┘
-                  │ similarity_search()
-                  ▼
-      ┌──────────────────────────────┐    ┌────────────────────────┐
-      │           ChromaDB            │◄───│     embeddings.py      │
-      │        chroma_store/          │    │  all-MiniLM-L6-v2      │
-      │  ┌─────┬──────┬─────┬───────┐ │    │  (local, on-device)    │
-      │  │ faq │tickets│guide│ plans │ │    └────────────────────────┘
-      │  └─────┴──────┴─────┴───────┘ │
-      └──────────────▲───────────────┘
-                     │ built once by
-                     │
-      ┌──────────────┴─────────────────────────────────────────────────────┐
-      │                INGESTION (run once / on data change)                 │
-      │  ingest_faq.py  ingest_tickets.py  ingest_guides.py  ingest_plans.py │
-      │       │               │                  │                 │         │
-      │       ▼               ▼                  ▼                 ▼         │
-      │  data/faq.csv   data/tickets.db   data/telecom_guide.pdf  data/plans.json
-      └──────────────────────────────────────────────────────────────────────┘
+                 ┌──────────────┐   ┌──────────────┐
+                 │  app.py      │   │  main.py     │   FRONT ENDS
+                 │ (Streamlit)  │   │  (CLI REPL)  │
+                 └──────┬───────┘   └──────┬───────┘
+                        └────────┬─────────┘
+                                 ▼
+                        ┌──────────────────┐
+                        │    router.py     │   classifies the question
+                        │   classify()     │   (one small Groq call)
+                        └───┬──────┬───────┬┘
+            pricing ───────┘      │        └─────── other
+                ▼          telecom ▼                  ▼
+   ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────┐
+   │ plan_facts.py      │  │ hybrid.py          │  │ deterministic       │
+   │ pricing reference  │  │ dense + BM25 recall │  │ refusal (no LLM)    │
+   │ + plans-only ctx   │  │ → rerank.py (top 5) │  └────────────────────┘
+   └─────────┬──────────┘  └─────────┬──────────┘
+             └───────────┬───────────┘
+                         ▼
+                 ┌──────────────────┐        ┌────────────────────────┐
+                 │     chain.py     │───────▶│   Groq LLM (external)  │
+                 │  prompt + stream │        │   qwen/qwen3-32b · T=0 │
+                 └──────────────────┘        └────────────────────────┘
+
+   Retrieval sources (built once by the ingest scripts):
+   ┌──────────────────────────────────────────────────────────────────┐
+   │  ChromaDB (chroma_store/):  faq · tickets · guides · plans         │
+   │  + BM25 keyword index over faq/tickets/guides (in memory)          │
+   │  embeddings: all-MiniLM-L6-v2 (local) · rerank: ms-marco-MiniLM    │
+   └──────────────────────────────────────────────────────────────────┘
 ```
 
 **Embedding model:** `all-MiniLM-L6-v2` (local, HuggingFace — no API cost)
-**Vector store:** ChromaDB, persisted to `chroma_store/`
-**LLM:** `qwen/qwen3-32b` via Groq API
-**Framework:** LangChain (LCEL chain) · **UI:** Streamlit + CLI
+**Vector store:** ChromaDB, persisted to `chroma_store/` · **Keyword index:** BM25
+**Re-ranker:** `ms-marco-MiniLM-L-6-v2` cross-encoder (local)
+**LLM:** `qwen/qwen3-32b` via Groq API · **Framework:** LangChain · **UI:** Streamlit + CLI
 
 ---
 
@@ -163,12 +152,14 @@ responsibilities.
      `COLLECTIONS = [("FAQ", …, 3), ("TICKETS", …, 3), ("GUIDES", …, 3),
      ("PLANS", …, 20)]`. To add a new knowledge source, you write a new
      `ingest_*.py` and append one line here.
-  2. For each incoming query, it runs `similarity_search` against **every
-     collection in parallel** (a thread pool), pulling that collection's `top_k`.
-     The default is 3; the small **`plans` catalog is retrieved in full (k=20)**
-     so pricing/comparison questions ("cheapest unlimited?", "which roaming
-     pass?") see *every* option, not just the 3 nearest matches.
-  3. `format_context()` stitches the results into a single block where every
+  2. For each incoming query, it runs `similarity_search` against the requested
+     collections **in parallel** (a thread pool), pulling each one's `top_k`.
+     The default is 3; the small **`plans` catalog is retrieved in full (k=20)**.
+     `retrieve(query, labels=…)` accepts an optional list of collection labels so
+     a caller can search only a **subset** — the router uses this to keep each
+     path focused (e.g. `["PLANS"]` for pricing, `["FAQ","TICKETS","GUIDES"]` for
+     the document path).
+  3. `format_docs()` stitches a document list into a single block where every
      document is prefixed with its source label, e.g. `[FAQ] …`, `[TICKETS] …`,
      `[GUIDES] …`, `[PLANS] …`. This is what gets injected into the prompt.
 
@@ -185,43 +176,57 @@ responsibilities.
   plus a single recommended lead ("cheapest unlimited plan with no eligibility:
   Prepaid Unlimited, $45/month"). `chain.py` prepends it to the context.
 
-**5. `chain.py`**
+**5. `router.py`**
 
-- **Purpose:** The RAG core — assembles retrieval, the prompt, and the LLM into
-  one LangChain LCEL chain, and exposes streaming.
+- **Purpose:** Classifies each question **before** retrieval, so the system can
+  send it down a focused path instead of asking one overloaded prompt to do
+  everything. One small Groq call returns `pricing`, `telecom`, or `other`
+  (defaults safely to `telecom` on any ambiguity).
+- **Why it matters:** Scope enforcement is now a **routing decision**, not a
+  prompt rule the model could ignore — off-topic questions never reach the LLM.
+
+**6. `hybrid.py`**
+
+- **Purpose:** Two-stage retrieval for the telecom document path.
+  1. **Recall** — gather candidates from **both** dense (Chroma vector) and
+     sparse (BM25 keyword) search, then union and de-duplicate them. Dense
+     captures meaning; sparse catches exact terms (codes, numbers, literal
+     phrases).
+  2. **Precision** — re-rank that pool with the cross-encoder (`rerank.py`) and
+     keep the top 5.
+
+**7. `rerank.py`**
+
+- **Purpose:** A cross-encoder (`ms-marco-MiniLM-L-6-v2`, local, ~80 MB) reads
+  the query and each candidate **together** and scores relevance directly — far
+  more accurate than the embedding model's separate scoring, but only run over
+  the small candidate set, not the whole corpus.
+
+**8. `chain.py`**
+
+- **Purpose:** The routed RAG core — classifies, assembles route-specific
+  context, then prompts the LLM and streams the answer.
 - **Workflow:**
-  1. A strict **system prompt** instructs the model to answer using **only** the
-     retrieved context — no outside knowledge, no invented prices/codes/policy.
-  2. If the context is insufficient, the model must say so plainly and direct the
-     user to **call 611 or use the MyTelecom app**.
-  3. The LCEL chain wires it together:
-     `{context: retriever, question} → ChatPromptTemplate → ChatGroq → StrOutputParser`.
-  4. The Groq LLM is `qwen/qwen3-32b` at **temperature 0** (deterministic), with
-     `reasoning_format="parsed"` so the model's internal reasoning is stripped
-     from the final answer.
-  5. Two entry points: `answer()` (full response) and `stream_answer()`
-     (token-by-token streaming for a responsive UI).
-- **Scope-awareness (in the system prompt):** the prompt restricts the bot to
-  NovaCell telecom topics. Off-topic requests (holiday itineraries, weather,
-  news, general knowledge) get a one-line "I can only help with NovaCell telecom
-  topics" redirect; if there's a relevant telecom angle (e.g. the user mentioned
-  travelling abroad) it may then offer that help (roaming options) without
-  inventing the off-topic content. This stops it from over-confidently answering
-  a "3-day India holiday plan" as if it were a roaming request.
-- **Plan & pricing rules (in the system prompt):** because plan/pricing is a
-  distinct, high-stakes domain, the prompt adds explicit guardrails:
-  - **`[PLANS]` is authoritative.** If an older `[FAQ]` or `[GUIDES]` entry
-    conflicts with the catalog (e.g. a stale roaming bundle), follow `[PLANS]`
-    and suppress the outdated one. Never surface a plan/price that isn't in
-    `[PLANS]`.
-  - **No invented plans or prices** — only names/prices that appear verbatim in
-    a `[PLANS]` block.
-  - **"Cheapest/best" questions** lead with the lowest-priced plan that has *no*
-    eligibility restriction, then note any cheaper eligibility-gated plans
-    (Student, 55+) — an eligibility-restricted plan is never presented as
-    available to a customer who hasn't said they qualify.
-  - **Roaming/travel** answers compute each option's total cost for the stated
-    trip length and recommend the genuinely lower-cost option.
+  1. `classify()` (router) picks the route.
+  2. **`other`** → returns a deterministic refusal, **no LLM call at all**.
+  3. **`pricing`** → context = the `plan_facts.py` pricing reference + plans-only
+     retrieval (no FAQ/guide), so stale data cannot leak into pricing answers.
+  4. **`telecom`** → context = `hybrid.py` (dense + BM25 → rerank).
+  5. The context + question go through `ChatPromptTemplate → ChatGroq →
+     StrOutputParser`. The LLM is `qwen/qwen3-32b` at **temperature 0** with
+     `reasoning_format="parsed"`.
+  6. Two entry points: `answer()` (full) and `stream_answer()` (token-by-token).
+- **System-prompt guardrails (still enforced):** answer ONLY from context; never
+  invent a plan/price; use the pre-sorted pricing reference directly for
+  "cheapest/best"; compare roaming totals correctly. (Scope is now handled by
+  the router rather than the prompt.)
+
+**9. `eval.py`**
+
+- **Purpose:** Golden-question evaluation harness. Encodes the scenario's sample
+  Q&A as objective `must_include` / `must_exclude` checks, so an architecture
+  change can be verified against a fixed yardstick instead of eyeballing. Run
+  with `uv run eval.py`.
 
 ### C. Front-End Interfaces
 
@@ -259,43 +264,37 @@ What happens when a user types a message? Here is the exact path:
 Front end (app.py / main.py) calls stream_answer(question)
         │
         ▼
-chain.py builds the LCEL input { question }
+router.py — classify(question)  ──►  pricing | telecom | other
         │
-        ▼
-retriever.py — MergedRetriever.format_context(question)
+        ├──────────────── other ────────────────┐
+        │                                        ▼
+        │                          Deterministic refusal — NO LLM call
+        │                          "I can only help with telecom topics"
         │
-        ├────────────┬────────────┬────────────┬────────────┐
-        ▼            ▼            ▼            ▼          (parallel)
-   ChromaDB·faq ChromaDB·tickets ChromaDB·guides ChromaDB·plans
-   top-3 docs    top-3 docs      top-3 docs   full catalog (k=20)
-        └────────────┴────────────┴────────────┴────────────┘
-                       │  source-labelled documents
-                       ▼
-        ChatPromptTemplate
-          ├─ system: "answer ONLY from context; else say so + call 611"
-          └─ human:  the user's question
-                       │
-                       ▼
-        Qwen3-32B on Groq  (temperature = 0, reasoning stripped)
-                       │
-                       ▼
-        StrOutputParser → tokens streamed back
-                       │
-        ┌──────────────┴───────────────┐
-        ▼                               ▼
-  Context sufficient?            Context insufficient?
-  → Grounded, source-based       → "I don't have that info —
-    step-by-step answer            call 611 or use the MyTelecom app"
-        │                               │
-        └───────────────┬───────────────┘
-                        ▼
-        Front end renders the streamed reply
-        (chat bubble in Streamlit, or live text in the CLI)
+        ├──────────────── pricing ───────────────┐
+        │                                         ▼
+        │              plan_facts.py pricing reference
+        │              + plans-only retrieval (no FAQ/guide)
+        │                                         │
+        └──────────────── telecom ────────────┐  │
+                                               ▼  │
+                  hybrid.py: dense (Chroma) + BM25 │
+                  → union → rerank.py (top 5)      │
+                                               │   │
+                                               ▼   ▼
+                                ChatPromptTemplate (context + question)
+                                               │
+                                               ▼
+                          Qwen3-32B on Groq  (temperature 0, reasoning stripped)
+                                               │
+                                               ▼
+                          StrOutputParser → tokens streamed to the UI
 ```
 
-The key design guarantee: **the model never answers from its own internal
-knowledge.** Off-topic questions (e.g. "What is the capital of France?") are
-declined and redirected — proven in testing.
+Two design guarantees: **the model never answers from its own internal
+knowledge** (it answers only from retrieved context, else redirects to 611), and
+**off-topic questions never reach the model** — the router refuses them
+deterministically.
 
 ---
 
@@ -326,7 +325,8 @@ uv sync
 ```
 
 (This installs LangChain, ChromaDB, sentence-transformers, the Groq client,
-Streamlit, and pypdf.)
+Streamlit, pypdf, and `rank-bm25` for hybrid search. On first run the app also
+downloads the cross-encoder re-ranker model `ms-marco-MiniLM-L-6-v2`, ~80 MB.)
 
 ### Step 3: Index the Documents
 
@@ -379,16 +379,20 @@ Type a question and press Enter; answers stream live. Type `quit` to exit.
 | Area | PRD IDs | Where it lives |
 |---|---|---|
 | Free-text + sample-button chat, history, clear, streaming | FR-01…05 | `app.py` |
-| Parallel retrieval from 4 collections, source labels | FR-06…08 | `retriever.py` |
+| Query routing (pricing / telecom / out-of-scope) | — | `router.py` |
+| Hybrid retrieval (dense + BM25) + cross-encoder re-rank | FR-06…08 | `hybrid.py`, `rerank.py`, `retriever.py` |
 | Local embeddings (`all-MiniLM-L6-v2`) | FR-09, NFR-02 | `embeddings.py` |
 | Context-only answers, refusal→611, temp 0, Qwen3-32B/Groq | FR-10…13 | `chain.py` |
 | Ingestion (CSV / SQLite / PDF / JSON), idempotent | FR-14…17 | `ingest_*.py` |
 | CLI REPL with `quit` | FR-18…19 | `main.py` |
+| Golden-question regression tests | — | `eval.py` |
 | No secrets in code, persisted store, extensibility | NFR-03/05/06 | `config.py`, `retriever.py` |
 
 ---
 
-## 6. Change Log — Plans & Pricing knowledge source
+## 6. Change Log
+
+### 6.1 Plans & Pricing knowledge source
 
 The `plans` collection was added after launch, when users reported wrong/vague
 answers to plan and pricing questions: the original three sources simply had no
@@ -418,4 +422,24 @@ retriever registry** — with two scenario-specific refinements:
 
 Files touched: `ingest_plans.py` (new), `plan_facts.py` (new), `config.py`,
 `retriever.py`, `chain.py`, `ingest_all.py`, `app.py`, `data/faq.csv`.
+
+### 6.2 Routed architecture (query routing + hybrid search + re-ranking)
+
+The fixes in 6.1 were pragmatic patches around one overloaded prompt — the LLM
+was doing ranking, stale-data suppression, and scope judgment itself. This
+change moves those jobs to the right layer:
+
+1. **Query router** (`router.py`): classify each question first; pricing,
+   telecom, and out-of-scope each get a focused path. Scope becomes a hard
+   routing decision (no LLM for `other`), and pricing context no longer pulls
+   FAQ/guide, so stale data cannot leak into pricing answers.
+2. **Hybrid retrieval** (`hybrid.py`): the telecom path fuses dense (Chroma) and
+   sparse (BM25) recall so exact terms are caught alongside semantic matches.
+3. **Cross-encoder re-ranking** (`rerank.py`): the candidate pool is re-scored
+   for precision; the top 5 go to the LLM.
+4. **Eval harness** (`eval.py`): golden-question checks; held at **9/9** across
+   the baseline and each step, so the refactor preserved correctness.
+
+New files: `router.py`, `hybrid.py`, `rerank.py`, `eval.py`. Modified:
+`chain.py`, `retriever.py`. New dependency: `rank-bm25`.
 ```
